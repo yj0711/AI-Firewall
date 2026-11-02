@@ -1,0 +1,193 @@
+"""Local reference gateway. See README before deployment."""
+import os
+import re
+import json
+import secrets
+import logging
+import unicodedata
+from dataclasses import dataclass
+from typing import Literal
+from uuid import uuid4
+
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, ConfigDict, Field
+
+log = logging.getLogger("firewall.audit")
+MAX_TEXT = 12000
+
+
+class Document(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    id: str = Field(min_length=1, max_length=100)
+    text: str = Field(max_length=MAX_TEXT)
+
+
+class Request(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    text: str = Field(min_length=1, max_length=MAX_TEXT)
+    documents: list[Document] = Field(default_factory=list, max_length=8)
+
+
+class ToolRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    tool: str = Field(min_length=1, max_length=80)
+    resource_id: str = Field(min_length=1, max_length=100)
+
+
+@dataclass(frozen=True)
+class Principal:
+    tenant: str
+    role: str
+
+
+@dataclass(frozen=True)
+class Resource:
+    tenant: str
+    roles: frozenset[str]
+
+
+def canonical(text):
+    text = unicodedata.normalize("NFKC", text).lower()
+    return "".join(c for c in text if unicodedata.category(c) != "Cf")
+
+
+RULES = {
+    "instruction_override": r"\b(?:ignore|disregard)\s+(?:(?:all|the|your)\s+)?(?:previous|prior|above)\s+(?:instructions|rules|prompts)\b",
+    "prompt_disclosure": r"\b(?:reveal|print|show)\s+(?:(?:me|your|the)\s+)*(?:system\s+prompt|hidden\s+instructions)\b",
+    "safety_override": r"\b(?:disable|bypass)\s+(?:(?:all|your|the)\s+)*(?:safety|security|content\s+filters)\b",
+    "secret_request": r"\b(?:send|leak|upload|reveal)\b.{0,100}\b(?:api\s*keys|passwords|credentials|company\s+files)\b",
+}
+SECRET_PATTERNS = [r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----", r"\bAKIA[A-Z0-9]{16}\b", r"\bghp_[A-Za-z0-9]{36}\b"]
+
+
+def signals(text):
+    plain = canonical(text)
+    alternate = plain.translate(str.maketrans({"0": "o", "1": "i", "3": "e", "@": "a", "5": "s"}))
+    hits = [name for name, pattern in RULES.items() if re.search(pattern, plain) or re.search(pattern, alternate)]
+    # Bounded signature for character-spaced instruction overrides.
+    compact = re.sub(r"[^a-z]", "", alternate)
+    if any(p in compact for p in ("ignorepreviousinstructions", "ignoreallpreviousinstructions", "revealyoursystemprompt")):
+        hits.append("obfuscated_instruction")
+    if any(re.search(p, text) for p in SECRET_PATTERNS):
+        hits.append("credential_pattern")
+    return sorted(set(hits))
+
+
+class Engine:
+    def __init__(self, resources=None, classifier=None):
+        self.resources = resources or {}
+        self.classifier = classifier
+
+    def authorized(self, principal, resource_id):
+        resource = self.resources.get(resource_id)
+        return bool(resource and resource.tenant == principal.tenant and principal.role in resource.roles)
+
+    def inspect(self, request, principal):
+        if sum(len(d.text) for d in request.documents) + len(request.text) > 24000:
+            return "BLOCK", ["aggregate_size_limit"]
+        # Check permission BEFORE examining document content.
+        if any(not self.authorized(principal, d.id) for d in request.documents):
+            return "BLOCK", ["document_access_denied"]
+        texts = [request.text] + [d.text for d in request.documents]
+        found = sorted({h for text in texts for h in signals(text)})
+        if found:
+            return "BLOCK", found
+        if self.classifier is None:
+            return "REVIEW", ["semantic_detector_not_configured"]
+        for text in texts:
+            try:
+                verdict = self.classifier(text)
+            except Exception:
+                return "REVIEW", ["semantic_detector_error"]
+            if verdict == "INJECTION":
+                return "BLOCK", ["semantic_injection"]
+            if verdict != "SAFE":
+                return "REVIEW", ["semantic_detector_unknown"]
+        return "ALLOW", ["checks_passed"]
+
+    def tool(self, request, principal):
+        # Reference policy: only read-only knowledge search is eligible.
+        if request.tool != "knowledge.search":
+            return "BLOCK", ["tool_not_authorized"]
+        if not self.authorized(principal, request.resource_id):
+            return "BLOCK", ["resource_access_denied"]
+        return "ALLOW", ["read_only_tool_authorized"]
+
+
+def create_app(engine=None, identities=None):
+    engine = engine or Engine()
+    identities = identities or {}
+    app = FastAPI(title="AI Firewall reference gateway", docs_url=None, redoc_url=None, openapi_url=None)
+    bearer = HTTPBearer(auto_error=False)
+
+    class BodyLimit:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                return await self.app(scope, receive, send)
+            body = bytearray()
+            while True:
+                message = await receive()
+                if message["type"] == "http.disconnect":
+                    return
+                body.extend(message.get("body", b""))
+                if len(body) > 100000:
+                    from starlette.responses import JSONResponse
+                    return await JSONResponse({"detail": "request too large"}, status_code=413)(scope, receive, send)
+                if not message.get("more_body", False):
+                    break
+            delivered = False
+            async def replay():
+                nonlocal delivered
+                if not delivered:
+                    delivered = True
+                    return {"type": "http.request", "body": bytes(body), "more_body": False}
+                return await receive()
+            await self.app(scope, replay, send)
+    app.add_middleware(BodyLimit)
+
+    async def identity(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)):
+        if credentials:
+            for token, principal in identities.items():
+                if secrets.compare_digest(credentials.credentials.encode("utf-8"), token.encode("utf-8")):
+                    return principal
+        raise HTTPException(401, "authentication required")
+
+    def result(principal, outcome):
+        decision, reasons = outcome
+        request_id = str(uuid4())
+        # Do not log raw prompts, documents, credentials, or model outputs.
+        log.info(json.dumps(dict(request_id=request_id, tenant=principal.tenant, decision=decision, reasons=reasons)))
+        return dict(request_id=request_id, policy_version="reference-1", decision=decision, reasons=reasons)
+
+    @app.post("/v1/inspect")
+    def inspect(request: Request, principal=Depends(identity)):
+        return result(principal, engine.inspect(request, principal))
+
+    @app.post("/v1/tools/authorize")
+    def tool(request: ToolRequest, principal=Depends(identity)):
+        return result(principal, engine.tool(request, principal))
+
+    @app.post("/v1/output/inspect")
+    def output(request: Request, principal=Depends(identity)):
+        if request.documents:
+            raise HTTPException(422, "output endpoint accepts text only")
+        found = signals(request.text)
+        return result(principal, ("BLOCK", found) if found else ("REVIEW", ["output_policy_review_required"]))
+
+    # Avoid echoing potentially sensitive inputs in validation failures.
+    from fastapi.exceptions import RequestValidationError
+    from starlette.responses import JSONResponse
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request, exc):
+        return JSONResponse({"detail": "invalid request"}, status_code=422)
+
+    return app
+
+
+# Local demo configuration. A server-side identity, never a tenant supplied in JSON.
+token = os.environ.get("FIREWALL_API_KEY")
+app = create_app(identities={token: Principal("demo", "reader")} if token else {})

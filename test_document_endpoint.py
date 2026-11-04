@@ -184,5 +184,30 @@ class DocumentEndpointTests(unittest.TestCase):
                 self.loader.assert_not_called()
 
 
+    def test_old_endpoint_rejects_supplied_documents(self):
+        response = self.client.post(
+            "/v1/inspect",
+            json={
+                "text": "What are the office hours?",
+                "documents": [
+                    {
+                        "id": "company-a-handbook",
+                        "text": "Caller-supplied replacement handbook.",
+                    }
+                ],
+            },
+            headers=self.headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["decision"], "BLOCK")
+        self.assertEqual(
+            response.json()["reasons"],
+            ["use_stored_document_endpoint"],
+        )
+        self.loader.assert_not_called()
+        self.classifier.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

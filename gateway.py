@@ -171,7 +171,16 @@ def create_app(engine=None, identities=None, document_loader=None):
 
     @app.post("/v1/inspect")
     def inspect(request: Request, principal=Depends(identity)):
-        return result(principal, engine.inspect(request, principal))
+        if request.documents:
+            return result(
+                principal,
+                ("BLOCK", ["use_stored_document_endpoint"]),
+            )
+
+        return result(
+            principal,
+            engine.inspect(request, principal),
+        )
     @app.post("/v1/documents/inspect")
     def inspect_stored_documents(
         request: StoredDocumentRequest,

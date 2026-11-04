@@ -1,4 +1,4 @@
-"""Local reference gateway. See README before deployment."""
+
 import os
 import re
 import json
@@ -27,6 +27,12 @@ class Request(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     text: str = Field(min_length=1, max_length=MAX_TEXT)
     documents: list[Document] = Field(default_factory=list, max_length=8)
+
+
+class StoredDocumentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    text: str = Field(min_length=1, max_length=MAX_TEXT)
+    document_ids: list[str] = Field(min_length=1, max_length=8)
 
 
 class ToolRequest(BaseModel):
@@ -115,7 +121,7 @@ class Engine:
         return "ALLOW", ["read_only_tool_authorized"]
 
 
-def create_app(engine=None, identities=None):
+def create_app(engine=None, identities=None, document_loader=None):
     engine = engine or Engine()
     identities = identities or {}
     app = FastAPI(title="AI Firewall reference gateway", docs_url=None, redoc_url=None, openapi_url=None)
@@ -166,6 +172,54 @@ def create_app(engine=None, identities=None):
     @app.post("/v1/inspect")
     def inspect(request: Request, principal=Depends(identity)):
         return result(principal, engine.inspect(request, principal))
+    @app.post("/v1/documents/inspect")
+    def inspect_stored_documents(
+        request: StoredDocumentRequest,
+        principal: Principal = Depends(identity),
+    ):
+        # Missing configuration must never become permission.
+        if document_loader is None:
+            return result(
+                principal,
+                ("REVIEW", ["document_store_not_configured"]),
+            )
+
+        # Validate identifiers before asking the document store.
+        if any(
+            not document_id.strip() or len(document_id) > 100
+            for document_id in request.document_ids
+        ):
+            raise HTTPException(422, "invalid document identifier")
+
+        if len(set(request.document_ids)) != len(request.document_ids):
+            raise HTTPException(422, "duplicate document identifiers")
+
+        try:
+            documents = [
+                document_loader(document_id, principal)
+                for document_id in request.document_ids
+            ]
+        except PermissionError:
+            return result(
+                principal,
+                ("BLOCK", ["document_access_denied"]),
+            )
+        except Exception:
+            # Do not expose internal errors or document contents.
+            return result(
+                principal,
+                ("REVIEW", ["document_store_error"]),
+            )
+
+        inspection = Request(
+            text=request.text,
+            documents=documents,
+        )
+        return result(
+            principal,
+            engine.inspect(inspection, principal),
+        )
+
 
     @app.post("/v1/tools/authorize")
     def tool(request: ToolRequest, principal=Depends(identity)):

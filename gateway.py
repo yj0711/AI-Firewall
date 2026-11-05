@@ -11,6 +11,7 @@ from typing import Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, Depends, HTTPException
+from starlette.requests import Request as HTTPRequest
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -156,14 +157,20 @@ def create_app(engine=None, identities=None, document_loader=None, audit_writer=
             await self.app(scope, replay, send)
     app.add_middleware(BodyLimit)
 
-    async def identity(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)):
+    def identity(request: HTTPRequest, credentials: HTTPAuthorizationCredentials | None = Depends(bearer)):
         if credentials:
             for token, principal in identities.items():
                 if secrets.compare_digest(credentials.credentials.encode("utf-8"), token.encode("utf-8")):
                     return principal
-        raise HTTPException(401, "authentication required")
+        reason = "invalid_credentials" if "authorization" in request.headers else "missing_credentials"
+        receipt = result(None, ("BLOCK", [reason]))
+        raise HTTPException(
+            401, "authentication required",
+            headers={"X-Request-ID": receipt["request_id"], "WWW-Authenticate": "Bearer"},
+        )
 
     def result(principal, outcome):
+        tenant = principal.tenant if principal is not None else "unauthenticated"
         decision, reasons = outcome
         request_id = str(uuid4())
         policy_version = "reference-1"
@@ -171,7 +178,7 @@ def create_app(engine=None, identities=None, document_loader=None, audit_writer=
             try:
                 audit_writer(
                     request_id=request_id,
-                    tenant=principal.tenant,
+                    tenant=tenant,
                     decision=decision,
                     reasons=reasons,
                     policy_version=policy_version,
@@ -180,7 +187,7 @@ def create_app(engine=None, identities=None, document_loader=None, audit_writer=
                 log.error("Audit write failed for request %s", request_id)
                 raise HTTPException(503, "audit storage unavailable") from None
         # Do not log raw prompts, documents, credentials, or model outputs.
-        log.info(json.dumps(dict(request_id=request_id, tenant=principal.tenant, decision=decision, reasons=reasons)))
+        log.info(json.dumps(dict(request_id=request_id, tenant=tenant, decision=decision, reasons=reasons)))
         return dict(request_id=request_id, policy_version=policy_version, decision=decision, reasons=reasons)
 
     @app.post("/v1/inspect")

@@ -2,6 +2,7 @@
 
 import os
 
+from audit_store import record_decision
 from gateway import Engine, Principal, create_app
 from document_store import fetch_document, resource_registry
 from model_detector import LocalDetector
@@ -34,4 +35,5 @@ def build_app():
         engine=engine,
         identities=identities,
         document_loader=fetch_document,
+        audit_writer=record_decision,
     )

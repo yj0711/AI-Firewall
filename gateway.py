@@ -4,6 +4,7 @@ import re
 import json
 import secrets
 import logging
+import sqlite3
 import unicodedata
 from dataclasses import dataclass
 from typing import Literal
@@ -121,7 +122,7 @@ class Engine:
         return "ALLOW", ["read_only_tool_authorized"]
 
 
-def create_app(engine=None, identities=None, document_loader=None):
+def create_app(engine=None, identities=None, document_loader=None, audit_writer=None):
     engine = engine or Engine()
     identities = identities or {}
     app = FastAPI(title="AI Firewall reference gateway", docs_url=None, redoc_url=None, openapi_url=None)
@@ -165,9 +166,22 @@ def create_app(engine=None, identities=None, document_loader=None):
     def result(principal, outcome):
         decision, reasons = outcome
         request_id = str(uuid4())
+        policy_version = "reference-1"
+        if audit_writer is not None:
+            try:
+                audit_writer(
+                    request_id=request_id,
+                    tenant=principal.tenant,
+                    decision=decision,
+                    reasons=reasons,
+                    policy_version=policy_version,
+                )
+            except (OSError, sqlite3.Error):
+                log.error("Audit write failed for request %s", request_id)
+                raise HTTPException(503, "audit storage unavailable") from None
         # Do not log raw prompts, documents, credentials, or model outputs.
         log.info(json.dumps(dict(request_id=request_id, tenant=principal.tenant, decision=decision, reasons=reasons)))
-        return dict(request_id=request_id, policy_version="reference-1", decision=decision, reasons=reasons)
+        return dict(request_id=request_id, policy_version=policy_version, decision=decision, reasons=reasons)
 
     @app.post("/v1/inspect")
     def inspect(request: Request, principal=Depends(identity)):

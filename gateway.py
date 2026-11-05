@@ -37,6 +37,12 @@ class StoredDocumentRequest(BaseModel):
     document_ids: list[str] = Field(min_length=1, max_length=8)
 
 
+class SearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    resource_id: str = Field(min_length=1, max_length=100)
+    query: str = Field(min_length=1, max_length=200)
+
+
 class ToolRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     tool: str = Field(min_length=1, max_length=80)
@@ -254,6 +260,33 @@ def create_app(engine=None, identities=None, document_loader=None, audit_writer=
     @app.post("/v1/tools/authorize")
     def tool(request: ToolRequest, principal=Depends(identity)):
         return result(principal, engine.tool(request, principal))
+
+    @app.post("/v1/tools/knowledge/search")
+    def search(request: SearchRequest, principal=Depends(identity)):
+        query = request.query.strip()
+        if not query:
+            raise HTTPException(422, "empty search query")
+        action = ToolRequest(tool="knowledge.search", resource_id=request.resource_id)
+        permission = engine.tool(action, principal)
+        if permission[0] != "ALLOW":
+            return result(principal, permission)
+        if document_loader is None:
+            return result(principal, ("REVIEW", ["document_store_not_configured"]))
+        try:
+            document = document_loader(request.resource_id, principal)
+        except PermissionError:
+            return result(principal, ("BLOCK", ["document_access_denied"]))
+        except Exception:
+            return result(principal, ("REVIEW", ["document_store_error"]))
+        if not isinstance(document, Document) or document.id != request.resource_id:
+            return result(principal, ("REVIEW", ["document_store_mismatch"]))
+        inspection = engine.inspect(Request(text=query, documents=[document]), principal)
+        if inspection[0] != "ALLOW":
+            return result(principal, inspection)
+        term = query.casefold()
+        matches = [line for line in document.text.splitlines() if term in line.casefold()][:5]
+        receipt = result(principal, ("ALLOW", ["knowledge_search_completed"]))
+        return {**receipt, "matches": matches}
 
     @app.post("/v1/output/inspect")
     def output(request: Request, principal=Depends(identity)):

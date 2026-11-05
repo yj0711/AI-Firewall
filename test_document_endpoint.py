@@ -40,6 +40,28 @@ class DocumentEndpointTests(unittest.TestCase):
             "document_ids": ["company-a-handbook"],
         }
 
+    def search(self, resource):
+        return self.client.post("/v1/tools/knowledge/search",
+                                json={"query": "OFFICE HOURS", "resource_id": resource},
+                                headers=self.headers).json()
+
+    def test_search_returns_matching_handbook_line(self):
+        response = self.search("company-a-handbook")
+        self.assertEqual(response["decision"], "ALLOW")
+        self.assertEqual(response["matches"], ["Company A office hours are Monday to Friday, 9 AM to 5 PM."])
+
+    def test_search_denies_other_tenant_before_read(self):
+        response = self.search("company-b-handbook")
+        self.assertEqual(response["reasons"], ["resource_access_denied"])
+        self.assertNotIn("matches", response)
+        self.loader.assert_not_called()
+
+    def test_search_withholds_text_on_detector_uncertainty(self):
+        self.classifier.return_value = "UNKNOWN"
+        response = self.search("company-a-handbook")
+        self.assertEqual(response["decision"], "REVIEW")
+        self.assertNotIn("matches", response)
+
     def test_authorized_document_uses_stored_text(self):
         response = self.client.post(
             PATH, json=self.payload, headers=self.headers

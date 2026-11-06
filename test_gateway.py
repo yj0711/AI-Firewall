@@ -23,6 +23,39 @@ class GatewayTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(self.e.inspect(Request(text=text), self.p)[0], "BLOCK")
 
+    def test_busy_server_recovers_capacity(self):
+        async def exercise():
+            import httpx
+            app = create_app()
+            entered = 0
+            full = asyncio.Event()
+            release = asyncio.Event()
+
+            @app.get("/practice")
+            async def practice():
+                nonlocal entered
+                entered += 1
+                if entered == 4:
+                    full.set()
+                await release.wait()
+                return "done"
+
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://test") as client:
+                tasks = [asyncio.create_task(client.get("/practice")) for _ in range(4)]
+                try:
+                    await asyncio.wait_for(full.wait(), 5)
+                    busy = await asyncio.wait_for(client.get("/practice"), 2)
+                    self.assertEqual(busy.status_code, 503)
+                    self.assertEqual(busy.headers["Retry-After"], "1")
+                finally:
+                    release.set()
+                    responses = await asyncio.gather(*tasks)
+                self.assertTrue(all(r.status_code == 200 for r in responses))
+                self.assertEqual((await client.get("/practice")).status_code, 200)
+
+        asyncio.run(exercise())
+
     def test_cross_tenant(self):
         self.assertEqual(self.e.inspect(Request(text="summary", documents=[Document(id="b", text="private")]), self.p)[0], "BLOCK")
 

@@ -163,6 +163,28 @@ def create_app(engine=None, identities=None, document_loader=None, audit_writer=
             await self.app(scope, replay, send)
     app.add_middleware(BodyLimit)
 
+    # Outermost middleware: reserve capacity before buffering the request body.
+    from threading import BoundedSemaphore
+
+    class CapacityLimit:
+        def __init__(self, app):
+            self.app = app
+            self.slots = BoundedSemaphore(4)
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http":
+                return await self.app(scope, receive, send)
+            if not self.slots.acquire(blocking=False):
+                response = JSONResponse({"detail": "server busy"}, status_code=503,
+                                        headers={"Retry-After": "1"})
+                return await response(scope, receive, send)
+            try:
+                return await self.app(scope, receive, send)
+            finally:
+                self.slots.release()
+
+    app.add_middleware(CapacityLimit)
+
     def identity(request: HTTPRequest, credentials: HTTPAuthorizationCredentials | None = Depends(bearer)):
         if credentials:
             for token, principal in identities.items():

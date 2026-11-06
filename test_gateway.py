@@ -97,6 +97,41 @@ class GatewayTests(unittest.TestCase):
             clock.return_value = 160
             self.assertEqual(asyncio.run(attempt("a", "wrong")).status_code, 401)
 
+    def test_scoped_share_receipt_and_refusals(self):
+        import json
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+        from contextlib import closing
+        from unittest.mock import patch
+        from audit_store import record_decision
+        from gateway import ShareApproval
+
+        slip = ShareApproval("company-a", "reader", "a", "trainer", "orientation", 200)
+        app = create_app(self.e, {"test-key": self.p}, audit_writer=record_decision,
+                         share_approvals={"slip": slip})
+        client = Client(app)
+        payload = dict(approval_id="slip", resource_id="a", recipient="trainer", task="orientation")
+        cases = [
+            ({}, 199, "ALLOW", "share_simulated"),
+            ({"recipient": "stranger"}, 199, "BLOCK", "share_approval_mismatch"),
+            ({"task": "other"}, 199, "BLOCK", "share_approval_mismatch"),
+            ({"resource_id": "b"}, 199, "BLOCK", "resource_access_denied"),
+            ({"approval_id": "invented"}, 199, "BLOCK", "share_approval_mismatch"),
+            ({}, 200, "BLOCK", "share_approval_expired"),
+        ]
+        with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", LOCALAPPDATA=folder):
+            for changes, now, decision, reason in cases:
+                with self.subTest(changes=changes, now=now), patch("gateway.time", return_value=now):
+                    response = client.post("/v1/tools/share/simulate", json=payload | changes,
+                                           headers=self.headers).json()
+                    self.assertEqual(response["decision"], decision)
+                    self.assertEqual("simulated_share" in response, decision == "ALLOW")
+                    with closing(sqlite3.connect(Path(folder)/"AI-Firewall"/"audit.sqlite3")) as db:
+                        row = db.execute("SELECT decision,reasons_json FROM decisions WHERE request_id=?",
+                                         (response["request_id"],)).fetchone()
+                    self.assertEqual(row, (decision, json.dumps([reason])))
+
     def test_cross_tenant(self):
         self.assertEqual(self.e.inspect(Request(text="summary", documents=[Document(id="b", text="private")]), self.p)[0], "BLOCK")
 

@@ -9,7 +9,7 @@ import unicodedata
 import math
 from collections import deque
 from threading import Lock
-from time import monotonic
+from time import monotonic, time
 from dataclasses import dataclass
 from typing import Literal
 from uuid import uuid4
@@ -45,6 +45,24 @@ class SearchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     resource_id: str = Field(min_length=1, max_length=100)
     query: str = Field(min_length=1, max_length=200)
+
+
+class ShareRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    approval_id: str = Field(min_length=1, max_length=100)
+    resource_id: str = Field(min_length=1, max_length=100)
+    recipient: str = Field(min_length=1, max_length=200)
+    task: str = Field(min_length=1, max_length=100)
+
+
+@dataclass(frozen=True)
+class ShareApproval:
+    tenant: str
+    role: str
+    resource_id: str
+    recipient: str
+    task: str
+    expires_at: float
 
 
 class ToolRequest(BaseModel):
@@ -133,7 +151,8 @@ class Engine:
         return "ALLOW", ["read_only_tool_authorized"]
 
 
-def create_app(engine=None, identities=None, document_loader=None, audit_writer=None, *, failed_signin_limit=5):
+def create_app(engine=None, identities=None, document_loader=None, audit_writer=None, *, failed_signin_limit=5, share_approvals=None):
+    approvals = dict(share_approvals or {})
     engine = engine or Engine()
     identities = identities or {}
     app = FastAPI(title="AI Firewall reference gateway", docs_url=None, redoc_url=None, openapi_url=None)
@@ -356,6 +375,20 @@ def create_app(engine=None, identities=None, document_loader=None, audit_writer=
         matches = [line for line in document.text.splitlines() if term in line.casefold()][:5]
         receipt = result(principal, ("ALLOW", ["knowledge_search_completed"]))
         return {**receipt, "matches": matches}
+
+    @app.post("/v1/tools/share/simulate")
+    def simulate_share(request: ShareRequest, principal=Depends(identity)):
+        slip = approvals.get(request.approval_id)
+        if not engine.authorized(principal, request.resource_id):
+            return result(principal, ("BLOCK", ["resource_access_denied"]))
+        if (slip is None or slip.tenant != principal.tenant or slip.role != principal.role
+                or slip.resource_id != request.resource_id or slip.recipient != request.recipient
+                or slip.task != request.task):
+            return result(principal, ("BLOCK", ["share_approval_mismatch"]))
+        if time() >= slip.expires_at:
+            return result(principal, ("BLOCK", ["share_approval_expired"]))
+        receipt = result(principal, ("ALLOW", ["share_simulated"]))
+        return {**receipt, "simulated_share": request.model_dump()}
 
     @app.post("/v1/output/inspect")
     def output(request: Request, principal=Depends(identity)):

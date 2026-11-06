@@ -1,9 +1,10 @@
 """Connect the components for a local development application."""
 
 import os
+from time import time
 
 from audit_store import record_decision
-from gateway import Engine, Principal, create_app
+from gateway import Engine, Principal, ShareApproval, create_app
 from document_store import fetch_document, resource_registry
 from model_detector import LocalDetector
 
@@ -36,4 +37,11 @@ def build_app():
         identities=identities,
         document_loader=fetch_document,
         audit_writer=record_decision,
+        share_approvals={
+            "practice-slip": ShareApproval(
+                tenant="company-a", role="reader", resource_id="company-a-handbook",
+                recipient="trainer@example.invalid", task="orientation",
+                expires_at=time() + 3600,
+            ),
+        },
     )

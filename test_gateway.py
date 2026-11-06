@@ -132,6 +132,26 @@ class GatewayTests(unittest.TestCase):
                                          (response["request_id"],)).fetchone()
                     self.assertEqual(row, (decision, json.dumps([reason])))
 
+    def test_concurrent_share_redeems_once(self):
+        from gateway import ShareApproval
+        slip = ShareApproval("company-a", "reader", "a", "trainer", "orientation", float("inf"))
+        app = create_app(self.e, {"test-key": self.p}, share_approvals={"slip": slip})
+        payload = dict(approval_id="slip", resource_id="a", recipient="trainer", task="orientation")
+
+        async def exercise():
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                async def submit(data):
+                    response = await client.post("/v1/tools/share/simulate", json=data, headers=self.headers)
+                    return response.json()
+                mismatch = await submit(payload | {"recipient": "stranger"})
+                self.assertEqual(mismatch["reasons"], ["share_approval_mismatch"])
+                results = await asyncio.gather(submit(payload), submit(payload))
+                self.assertCountEqual([r["reasons"] for r in results],
+                                      [["share_simulated"], ["share_approval_used"]])
+                self.assertEqual(sum("simulated_share" in r for r in results), 1)
+        asyncio.run(exercise())
+
     def test_cross_tenant(self):
         self.assertEqual(self.e.inspect(Request(text="summary", documents=[Document(id="b", text="private")]), self.p)[0], "BLOCK")
 

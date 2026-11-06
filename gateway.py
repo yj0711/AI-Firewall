@@ -153,6 +153,8 @@ class Engine:
 
 def create_app(engine=None, identities=None, document_loader=None, audit_writer=None, *, failed_signin_limit=5, share_approvals=None):
     approvals = dict(share_approvals or {})
+    redeemed = set()
+    redemption_lock = Lock()
     engine = engine or Engine()
     identities = identities or {}
     app = FastAPI(title="AI Firewall reference gateway", docs_url=None, redoc_url=None, openapi_url=None)
@@ -385,9 +387,13 @@ def create_app(engine=None, identities=None, document_loader=None, audit_writer=
                 or slip.resource_id != request.resource_id or slip.recipient != request.recipient
                 or slip.task != request.task):
             return result(principal, ("BLOCK", ["share_approval_mismatch"]))
-        if time() >= slip.expires_at:
-            return result(principal, ("BLOCK", ["share_approval_expired"]))
-        receipt = result(principal, ("ALLOW", ["share_simulated"]))
+        with redemption_lock:
+            if time() >= slip.expires_at:
+                return result(principal, ("BLOCK", ["share_approval_expired"]))
+            if request.approval_id in redeemed:
+                return result(principal, ("BLOCK", ["share_approval_used"]))
+            receipt = result(principal, ("ALLOW", ["share_simulated"]))
+            redeemed.add(request.approval_id)
         return {**receipt, "simulated_share": request.model_dump()}
 
     @app.post("/v1/output/inspect")

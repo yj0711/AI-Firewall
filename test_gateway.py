@@ -152,6 +152,21 @@ class GatewayTests(unittest.TestCase):
                 self.assertEqual(sum("simulated_share" in r for r in results), 1)
         asyncio.run(exercise())
 
+    def test_share_replay_after_restart(self):
+        import tempfile
+        from unittest.mock import patch
+        from audit_store import record_decision
+        from gateway import ShareApproval
+        slip = ShareApproval("company-a", "reader", "a", "trainer", "orientation", float("inf"))
+        with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", LOCALAPPDATA=folder):
+            for expected in ("share_simulated", "share_approval_used"):
+                restarted = create_app(self.e, {"test-key": self.p}, audit_writer=record_decision,
+                                       share_approvals={"slip": slip})
+                payload = dict(approval_id="slip", resource_id="a", recipient="trainer", task="orientation")
+                response = Client(restarted).post("/v1/tools/share/simulate", json=payload, headers=self.headers)
+                self.assertEqual(response.json()["reasons"], [expected])
+                self.assertEqual("simulated_share" in response.json(), expected == "share_simulated")
+
     def test_cross_tenant(self):
         self.assertEqual(self.e.inspect(Request(text="summary", documents=[Document(id="b", text="private")]), self.p)[0], "BLOCK")
 

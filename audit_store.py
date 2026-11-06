@@ -8,7 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-def record_decision(request_id, tenant, decision, reasons, policy_version):
+class ApprovalAlreadyUsed(Exception):
+    pass
+
+
+def record_decision(request_id, tenant, decision, reasons, policy_version, *, approval_id=None):
     folder = Path(os.environ["LOCALAPPDATA"]) / "AI-Firewall"
     folder.mkdir(parents=True, exist_ok=True)
     database = folder / "audit.sqlite3"
@@ -25,6 +29,17 @@ def record_decision(request_id, tenant, decision, reasons, policy_version):
                     policy_version TEXT NOT NULL
                 )
             """)
+            if approval_id is not None:
+                connection.execute("""CREATE TABLE IF NOT EXISTS redeemed_approvals (
+                    tenant TEXT NOT NULL, approval_id TEXT NOT NULL, request_id TEXT NOT NULL,
+                    PRIMARY KEY (tenant, approval_id))""")
+                inserted = connection.execute(
+                    "INSERT INTO redeemed_approvals VALUES (?, ?, ?) "
+                    "ON CONFLICT(tenant, approval_id) DO NOTHING",
+                    (tenant, approval_id, request_id),
+                )
+                if inserted.rowcount == 0:
+                    raise ApprovalAlreadyUsed()
             connection.execute(
                 "INSERT INTO decisions "
                 "(request_id, recorded_at_utc, tenant, decision, "

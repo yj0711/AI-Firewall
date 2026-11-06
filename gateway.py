@@ -5,6 +5,7 @@ import json
 import secrets
 import logging
 import sqlite3
+from audit_store import ApprovalAlreadyUsed
 import unicodedata
 import math
 from collections import deque
@@ -265,7 +266,7 @@ def create_app(engine=None, identities=None, document_loader=None, audit_writer=
             headers={"X-Request-ID": receipt["request_id"], "WWW-Authenticate": "Bearer"},
         )
 
-    def result(principal, outcome):
+    def result(principal, outcome, *, approval_id=None):
         tenant = principal.tenant if principal is not None else "unauthenticated"
         decision, reasons = outcome
         request_id = str(uuid4())
@@ -278,6 +279,7 @@ def create_app(engine=None, identities=None, document_loader=None, audit_writer=
                     decision=decision,
                     reasons=reasons,
                     policy_version=policy_version,
+                    **({"approval_id": approval_id} if approval_id is not None else {}),
                 )
             except (OSError, sqlite3.Error):
                 log.error("Audit write failed for request %s", request_id)
@@ -392,7 +394,10 @@ def create_app(engine=None, identities=None, document_loader=None, audit_writer=
                 return result(principal, ("BLOCK", ["share_approval_expired"]))
             if request.approval_id in redeemed:
                 return result(principal, ("BLOCK", ["share_approval_used"]))
-            receipt = result(principal, ("ALLOW", ["share_simulated"]))
+            try:
+                receipt = result(principal, ("ALLOW", ["share_simulated"]), approval_id=request.approval_id)
+            except ApprovalAlreadyUsed:
+                return result(principal, ("BLOCK", ["share_approval_used"]))
             redeemed.add(request.approval_id)
         return {**receipt, "simulated_share": request.model_dump()}
 

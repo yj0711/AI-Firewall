@@ -133,7 +133,7 @@ class Engine:
         return "ALLOW", ["read_only_tool_authorized"]
 
 
-def create_app(engine=None, identities=None, document_loader=None, audit_writer=None):
+def create_app(engine=None, identities=None, document_loader=None, audit_writer=None, *, failed_signin_limit=5):
     engine = engine or Engine()
     identities = identities or {}
     app = FastAPI(title="AI Firewall reference gateway", docs_url=None, redoc_url=None, openapi_url=None)
@@ -205,6 +205,11 @@ def create_app(engine=None, identities=None, document_loader=None, audit_writer=
                                     headers={"Retry-After": str(retry)})
             history.append(now)
 
+    if type(failed_signin_limit) is not int or failed_signin_limit < 1:
+        raise ValueError("failed_signin_limit must be a positive integer")
+    failed_sources = {}
+    failure_lock = Lock()
+
     def identity(request: HTTPRequest, credentials: HTTPAuthorizationCredentials | None = Depends(bearer)):
         if credentials:
             for token, principal in identities.items():
@@ -212,7 +217,28 @@ def create_app(engine=None, identities=None, document_loader=None, audit_writer=
                     check_rate(token)
                     return principal
         reason = "invalid_credentials" if "authorization" in request.headers else "missing_credentials"
-        receipt = result(None, ("BLOCK", [reason]))
+        source = request.client.host if request.client else "unknown"
+        with failure_lock:
+            now = monotonic()
+            count, deadline = failed_sources.get(source, (0, now + 60))
+            if now >= deadline:
+                count, deadline = 0, now + 60
+            if count >= failed_signin_limit:
+                raise HTTPException(429, "sign-in cooldown",
+                                    headers={"Retry-After": str(max(1, math.ceil(deadline - now)))})
+            if source not in failed_sources and len(failed_sources) >= 4096:
+                for peer in [peer for peer, (_, end) in failed_sources.items() if end <= now]:
+                    del failed_sources[peer]
+                if len(failed_sources) >= 4096:
+                    raise HTTPException(503, "sign-in capacity reached", headers={"Retry-After": "1"})
+            count += 1
+            if count == failed_signin_limit:
+                deadline = now + 60
+            failed_sources[source] = count, deadline
+        reasons = [reason]
+        if count == failed_signin_limit:
+            reasons.append("signin_cooldown_started")
+        receipt = result(None, ("BLOCK", reasons))
         raise HTTPException(
             401, "authentication required",
             headers={"X-Request-ID": receipt["request_id"], "WWW-Authenticate": "Bearer"},

@@ -73,6 +73,30 @@ class GatewayTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_failed_signin_cooldown(self):
+        from unittest.mock import Mock, patch
+        writer = Mock()
+        app = create_app(self.e, {"test-key": self.p}, audit_writer=writer, failed_signin_limit=2)
+
+        async def attempt(source, key):
+            transport = httpx.ASGITransport(app=app, client=(source, 1234))
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                return await client.post("/v1/inspect", json={"text": "hello"},
+                                         headers={"Authorization": "Bearer " + key})
+
+        with patch("gateway.monotonic", return_value=100) as clock:
+            for key in ("wrong-one", "wrong-two"):
+                self.assertEqual(asyncio.run(attempt("a", key)).status_code, 401)
+            self.assertIn("signin_cooldown_started", writer.call_args.kwargs["reasons"])
+            limited = asyncio.run(attempt("a", "wrong-three"))
+            self.assertEqual(limited.status_code, 429)
+            self.assertEqual(limited.headers["Retry-After"], "60")
+            self.assertEqual(writer.call_count, 2)
+            self.assertEqual(asyncio.run(attempt("b", "wrong")).status_code, 401)
+            self.assertEqual(asyncio.run(attempt("a", "test-key")).status_code, 200)
+            clock.return_value = 160
+            self.assertEqual(asyncio.run(attempt("a", "wrong")).status_code, 401)
+
     def test_cross_tenant(self):
         self.assertEqual(self.e.inspect(Request(text="summary", documents=[Document(id="b", text="private")]), self.p)[0], "BLOCK")
 

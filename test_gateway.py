@@ -23,6 +23,23 @@ class GatewayTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(self.e.inspect(Request(text=text), self.p)[0], "BLOCK")
 
+    def test_badge_rate_limit_is_independent_and_expires(self):
+        from unittest.mock import patch
+        client = Client(create_app(self.e, {"first": self.p, "second": self.p}))
+        def call(token):
+            return client.post("/v1/inspect", json={"text": "hello"},
+                               headers={"Authorization": "Bearer " + token})
+        with patch("gateway.monotonic", return_value=100) as clock:
+            for _ in range(30):
+                self.assertEqual(call("first").status_code, 200)
+            clock.return_value = 159
+            denied = call("first")
+            self.assertEqual(denied.status_code, 429)
+            self.assertEqual(denied.headers["Retry-After"], "1")
+            self.assertEqual(call("second").status_code, 200)
+            clock.return_value = 160
+            self.assertEqual(call("first").status_code, 200)
+
     def test_busy_server_recovers_capacity(self):
         async def exercise():
             import httpx

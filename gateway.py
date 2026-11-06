@@ -6,6 +6,10 @@ import secrets
 import logging
 import sqlite3
 import unicodedata
+import math
+from collections import deque
+from threading import Lock
+from time import monotonic
 from dataclasses import dataclass
 from typing import Literal
 from uuid import uuid4
@@ -185,10 +189,27 @@ def create_app(engine=None, identities=None, document_loader=None, audit_writer=
 
     app.add_middleware(CapacityLimit)
 
+    # Each configured badge has a bounded history of accepted requests.
+    recent_requests = {token: deque() for token in identities}
+    rate_lock = Lock()
+
+    def check_rate(token):
+        with rate_lock:
+            now = monotonic()
+            history = recent_requests[token]
+            while history and now - history[0] >= 60:
+                history.popleft()
+            if len(history) >= 30:
+                retry = max(1, math.ceil(60 - (now - history[0])))
+                raise HTTPException(429, "badge rate limit reached",
+                                    headers={"Retry-After": str(retry)})
+            history.append(now)
+
     def identity(request: HTTPRequest, credentials: HTTPAuthorizationCredentials | None = Depends(bearer)):
         if credentials:
             for token, principal in identities.items():
                 if secrets.compare_digest(credentials.credentials.encode("utf-8"), token.encode("utf-8")):
+                    check_rate(token)
                     return principal
         reason = "invalid_credentials" if "authorization" in request.headers else "missing_credentials"
         receipt = result(None, ("BLOCK", [reason]))

@@ -1,128 +1,59 @@
-# AI Firewall — Hybrid Prompt-Injection Detection
+# AI Firewall
 
-A Python security prototype that screens messages for prompt-injection attempts using rule-based detection and a pretrained machine-learning classifier.
+AI Firewall is a local Python prototype for two security decisions: whether a piece of text looks like prompt injection, and whether a caller has permission to act on a document. It began as a [Google Colab experiment](ai_firewall_yj.ipynb). The [FastAPI application](local_app.py) now connects the detector to a small document store and a SQLite audit log.
 
-Developed in Google Colab, the project explores how combining two detection methods can help identify suspicious instructions before they are forwarded to an AI application.
+## What the application does
 
-## Problem Statement
+The demo contains two fictional company handbooks. A Company A reader can search its own handbook. Submitting the same query against Company B's handbook should produce a block. The [search endpoint](gateway.py) checks the caller's tenant and role before loading the document, screens the query and retrieved text, then returns matching lines when inspection allows it. Search is a case-insensitive substring match.
 
-Prompt-injection attacks attempt to manipulate an AI application through instructions embedded in incoming text. These instructions may ask the AI to disregard its original task, reveal hidden instructions, bypass restrictions, or expose sensitive information.
+The local application also supports simulated document sharing. An approval is scoped to a tenant, role, document, recipient, task, and expiry time. The application records when an approval is used or revoked so that restarting with the same database preserves that decision. A simulated share produces a receipt. No document is sent to the recipient. The [audit store](audit_store.py) records the request ID, timestamp, tenant, decision, reason codes, and policy version.
 
-This project addresses the need for an additional screening layer that distinguishes potentially malicious instructions from ordinary requests.
+The [model adapter](model_detector.py) runs the pretrained [Protect AI DeBERTa classifier](https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2) locally on CPU. This repository integrates the model and adds rules and application-level controls. The adapter returns `UNKNOWN` for inputs that exceed its limits. The notebook's downstream AI response is a placeholder.
 
-## Project Objectives
+## What the evaluation shows
 
-- Detect common prompt-injection patterns.
-- Integrate a pretrained classifier for an additional detection signal.
-- Combine both detectors into an allow-or-block decision.
-- Evaluate predictions against labeled attack and benign examples.
-- Identify missed attacks and incorrectly blocked legitimate messages.
+| Evidence | Result in the repository |
+| --- | --- |
+| Original notebook evaluation | The saved output shows 10 of 10 hand-written injection examples blocked and 10 of 10 benign examples allowed. Several examples closely match the rules. |
+| Character-substitution baseline | The capstone write-up reports 6 of 10 detected. In the published notebook the baseline cell stops with `NameError: name 'attacks' is not defined`. The repository does not reproduce that figure from a clean run. |
+| Normalization experiment | A later cell displays 10 of 10 detections in each of five conditions using the same ten underlying examples. That cell does not report a benign retest. The change in false positives after normalization remains unknown. |
+| Gateway regression tests | The repository includes tests for document permissions, tool decisions, approval expiry, replay and revocation, and audit behavior. The document endpoint tests substitute a mock classifier so permission decisions can be tested independently of model predictions. |
 
-## Detection Approach
+The twenty starter examples are too few to estimate real-world accuracy. The tests also leave open how often an unseen prompt passes the detector or causes an unauthorized outcome in a deployed application. The most informative next evaluation would freeze a held-out set of requests and record three outcomes separately: detector verdict, authorized action completed, and unauthorized document content returned.
 
-### 1. Rule-Based Detection
+## Run the gateway tests
 
-The first layer uses Python regular expressions to identify suspicious instruction patterns, including requests to:
+From the repository root in Windows PowerShell, using Python 3.13:
 
-- Ignore or disregard previous instructions.
-- Reveal a system prompt or hidden configuration.
-- Enter an unrestricted or jailbreak mode.
-- Bypass safety restrictions.
-- Disable filters.
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m unittest discover -v
+```
 
-When a pattern matches, the detector returns a flag and the matching rule.
+These tests use local fixtures. Running the full classifier requires additional dependencies and cached model weights.
 
-### 2. Machine-Learning Detection
+## Run the local application with the classifier
 
-The second layer uses the pretrained Hugging Face model:
+From the same directory and environment:
 
-`protectai/deberta-v3-base-prompt-injection-v2`
+```powershell
+.\.venv\Scripts\python.exe -m pip install torch transformers sentencepiece huggingface_hub
+.\.venv\Scripts\python.exe -c "from huggingface_hub import snapshot_download; snapshot_download('protectai/deberta-v3-base-prompt-injection-v2')"
+$env:FIREWALL_API_KEY = .\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(32))"
+.\.venv\Scripts\python.exe -m uvicorn local_app:build_app --factory --host 127.0.0.1
+```
 
-The model classifies text as `SAFE` or `INJECTION` and returns a confidence score.
+The download requires internet access. On startup the adapter reads the model from the local cache. To exercise manager revocation, set `FIREWALL_MANAGER_KEY` to a second independently generated key before starting the server. The SQLite database lives at `%LOCALAPPDATA%\AI-Firewall\audit.sqlite3`.
 
-This project integrates the pretrained model; it does not train a new model from scratch.
+Open [the local API documentation](http://127.0.0.1:8000/docs), authorize with the reader key from the server's PowerShell session, and try `POST /v1/tools/knowledge/search` with this body:
 
-### 3. Combined Decision
+```json
+{"resource_id": "company-a-handbook", "query": "office hours"}
+```
 
-The firewall blocks a message if either detector flags it:
+The expected result is an allow decision with the matching handbook line. Change only the resource ID to `company-b-handbook`. The expected result is a block without document content. This comparison tests the permission boundary with the same ordinary text on both requests.
 
-`blocked = rule_flag or ml_flag`
+## Scope
 
-A message is allowed only when neither detector flags it.
-
-## Workflow
-
-Incoming message → Rule and model checks → Combined decision → ALLOWED or BLOCKED
-
-The notebook displays the message verdict, rule-based explanation, model label, and confidence score.
-
-## Evaluation
-
-The starter evaluation contains 20 manually labeled messages:
-
-- 10 prompt-injection examples.
-- 10 benign requests.
-
-The evaluation reports:
-
-- True positives: attacks correctly blocked.
-- False negatives: attacks incorrectly allowed.
-- True negatives: benign messages correctly allowed.
-- False positives: benign messages incorrectly blocked.
-- Accuracy, precision, recall, and F1 score.
-
-Numerical results should be reported from the executed notebook. Performance on this small example set should not be interpreted as a general real-world detection rate.
-
-## Technology Stack
-
-- Python
-- Google Colab
-- Python regular expressions (`re`)
-- Hugging Face Transformers
-- PyTorch
-- SentencePiece
-- pandas
-- Pretrained DeBERTa prompt-injection classifier
-
-## Running the Notebook
-
-1. Open the project’s `.ipynb` notebook in Google Colab.
-2. Run the dependency-installation cell.
-3. Run the rule-based detector cell.
-4. Load the pretrained classifier.
-5. Run the combined firewall function.
-6. Run the labeled evaluation and inspect the results.
-
-The initial setup requires internet access to install dependencies and download the model.
-
-Both detector layers must initialize successfully before running the combined firewall in the provided implementation.
-
-## Demonstration Scope
-
-The demonstration shows how messages receive allow-or-block decisions.
-
-The included `protected_ai` function uses a placeholder response for allowed messages. It does not connect to a downstream language model or demonstrate that an attack succeeds against an unprotected model.
-
-## Limitations
-
-- The evaluation uses a small, manually constructed example set.
-- Several attack examples closely resemble the rules, limiting how well the test measures generalization.
-- Unfamiliar wording, obfuscation, or context-dependent attacks may evade detection.
-- Legitimate text discussing attacks may be incorrectly blocked.
-- Blocking when either detector flags a message can increase false positives.
-- Model confidence is not a guarantee that a classification is correct.
-- The prototype screens text; it does not enforce tool permissions, isolate execution, or control network access.
-
-## Future Work
-
-- Evaluate rules alone, the classifier alone, and the combined approach separately.
-- Expand testing with independent datasets and more varied benign examples.
-- Test obfuscated, multilingual, and indirect prompt injections.
-- Measure processing latency alongside detection performance.
-- Add explicit handling for long inputs and model failures.
-- Connect the filter to an actual AI application for end-to-end evaluation.
-- Add a simple interface for interactive testing.
-
-## Intended Contribution
-
-The project demonstrates the integration of rule-based and machine-learning detection into a single filtering workflow, along with an evaluation process that makes both successful detections and errors visible.
+The application uses demo identities, fictional records, and a local database. It has no external document-sharing integration or downstream generative model. The repository demonstrates specific controls that can be inspected and tested. Production readiness and robustness against adaptive prompt injection remain unevaluated.

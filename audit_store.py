@@ -12,6 +12,10 @@ class ApprovalAlreadyUsed(Exception):
     pass
 
 
+class ApprovalRevoked(Exception):
+    pass
+
+
 def record_decision(request_id, tenant, decision, reasons, policy_version, *, approval_id=None):
     folder = Path(os.environ["LOCALAPPDATA"]) / "AI-Firewall"
     folder.mkdir(parents=True, exist_ok=True)
@@ -39,6 +43,14 @@ def record_decision(request_id, tenant, decision, reasons, policy_version, *, ap
                     (tenant, approval_id, request_id),
                 )
                 if inserted.rowcount == 0:
+                    previous = connection.execute(
+                        "SELECT d.reasons_json FROM redeemed_approvals a "
+                        "JOIN decisions d ON d.request_id = a.request_id "
+                        "WHERE a.tenant = ? AND a.approval_id = ?",
+                        (tenant, approval_id),
+                    ).fetchone()
+                    if previous and json.loads(previous[0]) == ["share_approval_revoked"]:
+                        raise ApprovalRevoked()
                     raise ApprovalAlreadyUsed()
             connection.execute(
                 "INSERT INTO decisions "

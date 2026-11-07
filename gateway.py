@@ -5,7 +5,7 @@ import json
 import secrets
 import logging
 import sqlite3
-from audit_store import ApprovalAlreadyUsed
+from audit_store import ApprovalAlreadyUsed, ApprovalRevoked
 import unicodedata
 import math
 from collections import deque
@@ -380,6 +380,20 @@ def create_app(engine=None, identities=None, document_loader=None, audit_writer=
         receipt = result(principal, ("ALLOW", ["knowledge_search_completed"]))
         return {**receipt, "matches": matches}
 
+    @app.post("/v1/approvals/{approval_id}/revoke")
+    def revoke_approval(approval_id: str, principal=Depends(identity)):
+        slip = approvals.get(approval_id)
+        if principal.role != "manager" or slip is None or slip.tenant != principal.tenant:
+            return result(principal, ("BLOCK", ["revocation_not_authorized"]))
+        if audit_writer is None:
+            raise HTTPException(503, "audit storage unavailable")
+        try:
+            return result(principal, ("ALLOW", ["share_approval_revoked"]), approval_id=approval_id)
+        except ApprovalRevoked:
+            return result(principal, ("BLOCK", ["share_approval_revoked"]))
+        except ApprovalAlreadyUsed:
+            return result(principal, ("BLOCK", ["share_approval_used"]))
+
     @app.post("/v1/tools/share/simulate")
     def simulate_share(request: ShareRequest, principal=Depends(identity)):
         slip = approvals.get(request.approval_id)
@@ -396,6 +410,8 @@ def create_app(engine=None, identities=None, document_loader=None, audit_writer=
                 return result(principal, ("BLOCK", ["share_approval_used"]))
             try:
                 receipt = result(principal, ("ALLOW", ["share_simulated"]), approval_id=request.approval_id)
+            except ApprovalRevoked:
+                return result(principal, ("BLOCK", ["share_approval_revoked"]))
             except ApprovalAlreadyUsed:
                 return result(principal, ("BLOCK", ["share_approval_used"]))
             redeemed.add(request.approval_id)

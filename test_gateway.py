@@ -167,6 +167,31 @@ class GatewayTests(unittest.TestCase):
                 self.assertEqual(response.json()["reasons"], [expected])
                 self.assertEqual("simulated_share" in response.json(), expected == "share_simulated")
 
+    def test_manager_revocation_survives_restart(self):
+        import tempfile
+        from unittest.mock import patch
+        from audit_store import record_decision
+        from gateway import ShareApproval
+
+        slip = ShareApproval("company-a", "reader", "a", "trainer", "orientation", float("inf"))
+        identities = {"test-key": self.p, "manager": Principal("company-a", "manager"),
+                      "other": Principal("company-b", "manager")}
+        with tempfile.TemporaryDirectory() as folder, patch.dict("os.environ", LOCALAPPDATA=folder):
+            def client():
+                return Client(create_app(self.e, identities, audit_writer=record_decision,
+                                         share_approvals={"slip": slip}))
+
+            session = client()
+            for key, expected in [("test-key", "BLOCK"), ("other", "BLOCK"), ("manager", "ALLOW")]:
+                response = session.post("/v1/approvals/slip/revoke",
+                                        headers={"Authorization": "Bearer " + key})
+                self.assertEqual(response.json()["decision"], expected)
+            payload = dict(approval_id="slip", resource_id="a", recipient="trainer", task="orientation")
+            response = client().post("/v1/tools/share/simulate", json=payload, headers=self.headers)
+            self.assertEqual(response.json()["decision"], "BLOCK")
+            self.assertEqual(response.json()["reasons"], ["share_approval_revoked"])
+            self.assertNotIn("simulated_share", response.json())
+
     def test_cross_tenant(self):
         self.assertEqual(self.e.inspect(Request(text="summary", documents=[Document(id="b", text="private")]), self.p)[0], "BLOCK")
 

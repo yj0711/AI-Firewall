@@ -32,6 +32,12 @@ def build_app():
         token: Principal("company-a", "reader"),
     }
 
+    manager_key = os.environ.get("FIREWALL_MANAGER_KEY")
+    if manager_key is not None:
+        if len(manager_key) < 32 or manager_key != manager_key.strip() or manager_key == token:
+            raise RuntimeError("Use a separate random manager key of at least 32 characters.")
+        identities[manager_key] = Principal("company-a", "manager")
+
     return create_app(
         engine=engine,
         identities=identities,
